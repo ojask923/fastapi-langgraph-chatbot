@@ -51,6 +51,7 @@ from sqlmodel import Field, Session, SQLModel, select
 from flashrank import Ranker, RerankRequest
 
 from app.config import settings
+from app.services.qdrant_shared import get_qdrant_client, get_hf_embeddings
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,18 @@ class RetrievedChunk:
 
     Returned by :meth:`RAGService.retrieve_structured`. Retains all provenance
     information needed to produce grounded, citable LLM responses.
+
+    Score fields
+    ------------
+    dense_score:
+        Raw cosine-similarity score returned by Qdrant for the dense vector
+        query.  Always populated (range ~0.0–1.0).
+    fusion_score:
+        Reciprocal Rank Fusion (RRF) score combining dense + sparse rankings.
+        Only meaningful when ``ENABLE_HYBRID_SEARCH=True``; ``None`` otherwise.
+    rerank_score:
+        FlashRank cross-encoder score.  Only set when ``ENABLE_RERANKING=True``
+        and the reranker succeeded; ``None`` on fallback.
     """
 
     # Content
@@ -80,9 +93,12 @@ class RetrievedChunk:
     chunk_index: int = 0
     source: str = ""  # same as filename for documents
 
-    # Scoring
-    rrf_score: float = 0.0          # combined RRF score from dense/sparse fusion
-    rerank_score: Optional[float] = None  # FlashRank cross-encoder score; None on fallback
+    # Scoring — always a raw cosine similarity from the dense index (~0.0–1.0)
+    dense_score: float = 0.0
+    # Fusion score from RRF over dense+sparse; None when hybrid search is disabled
+    fusion_score: Optional[float] = None
+    # FlashRank cross-encoder score; None when reranking is off or failed
+    rerank_score: Optional[float] = None
 
     # Telemetry (set once on the list, carried per-chunk for convenience)
     retrieval_latency_ms: float = 0.0
@@ -110,8 +126,9 @@ def format_cited_context(
         into the system prompt or tool message.
     citation_map : dict
         Maps 1-based integer index → citation metadata dict containing
-        filename, page_number, section, chunk_id, document_id, rrf_score,
-        and rerank_score.
+        filename, page_number, section, chunk_id, document_id, dense_score,
+        fusion_score (None when hybrid search is off), and rerank_score
+        (None when reranking is off or failed).
     """
     if not chunks:
         return "", {}
@@ -136,8 +153,17 @@ def format_cited_context(
             "section": chunk.section,
             "chunk_id": chunk.chunk_id,
             "document_id": chunk.document_id,
-            "rrf_score": round(chunk.rrf_score, 4),
-            "rerank_score": round(chunk.rerank_score, 4) if chunk.rerank_score is not None else None,
+            # dense_score is always a raw cosine similarity (~0.0-1.0)
+            "dense_score": round(float(chunk.dense_score), 4),
+            # fusion_score is only meaningful when hybrid search is enabled
+            "fusion_score": (
+                round(float(chunk.fusion_score), 4)
+                if chunk.fusion_score is not None else None
+            ),
+            "rerank_score": (
+                round(float(chunk.rerank_score), 4)
+                if chunk.rerank_score is not None else None
+            ),
         }
 
     context_block = "\n\n".join(parts)
@@ -257,14 +283,9 @@ class RAGService:
     # ------------------------------------------------------------------
 
     def _init_vector_store(self):
-        os.makedirs(settings.VECTOR_STORE_PATH, exist_ok=True)
-        try:
-            client = QdrantClient(path=settings.VECTOR_STORE_PATH)
-        except Exception as exc:
-            logger.warning(
-                "Local Qdrant path locked or unavailable (%s). Using in-memory store.", exc
-            )
-            client = QdrantClient(location=":memory:")
+        # Use the shared client — only one QdrantClient opens the on-disk path
+        # so there is no double file-lock with the mem0 Qdrant instance.
+        client = get_qdrant_client()
 
         collection_name = "chatbot_documents"
         is_hybrid = getattr(settings, "ENABLE_HYBRID_SEARCH", False)
@@ -314,10 +335,10 @@ class RAGService:
                 model=settings.EMBEDDING_MODEL,
                 openai_api_key=settings.OPENAI_API_KEY,
             )
-        elif provider == "huggingface":
-            return HuggingFaceEmbeddings(model_name=settings.EMBEDDING_MODEL)
         else:
-            return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+            # Both "huggingface" and any unrecognised provider use the shared
+            # HuggingFaceEmbeddings singleton so the model is loaded only once.
+            return get_hf_embeddings()
 
     # ------------------------------------------------------------------
     # Stage 1 — Validation
@@ -560,6 +581,27 @@ class RAGService:
         raw = f"{document_id}:{chunk_index}"
         return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
+    @staticmethod
+    def _merge_lines(line_docs: List[Document]) -> str:
+        """Join per-line Documents into clean, embedding-friendly prose.
+
+        Steps applied to the raw ``"\n".join(...)`` text:
+
+        1. **De-hyphenation** — remove line-end soft hyphens so that
+           ``"infor-\nmation"`` becomes ``"information"``.
+        2. **Paragraph-aware join** — blank lines in the original PDF layout
+           produce a ``"\n\n"`` paragraph break; all other single ``"\n"``
+           separators (normal line-wraps within the same paragraph) are
+           replaced by a single space so the text reads as continuous prose.
+        """
+        raw = "\n".join(d.page_content for d in line_docs)
+        # Step 1 — remove hyphenation at line endings (e.g. "infor-\nmation")
+        raw = re.sub(r"-\n(?=\w)", "", raw)
+        # Step 2 — collapse single \n (soft line wrap) → space;
+        #           double \n (paragraph boundary) is left intact.
+        raw = re.sub(r"(?<!\n)\n(?!\n)", " ", raw)
+        return raw
+
     def _chunk(self, documents: List[Document]) -> List[Document]:
         """Split documents into semantically-bounded chunks.
 
@@ -596,14 +638,14 @@ class RAGService:
                 if same_section and same_page and same_doc:
                     current_group.append(doc)
                 else:
-                    merged_text = "\n".join(d.page_content for d in current_group)
+                    merged_text = self._merge_lines(current_group)
                     merged_metadata = current_group[0].metadata.copy()
                     merged_metadata.pop("layout", None)
                     grouped_docs.append(Document(page_content=merged_text, metadata=merged_metadata))
                     current_group = [doc]
             
             if current_group:
-                merged_text = "\n".join(d.page_content for d in current_group)
+                merged_text = self._merge_lines(current_group)
                 merged_metadata = current_group[0].metadata.copy()
                 merged_metadata.pop("layout", None)
                 grouped_docs.append(Document(page_content=merged_text, metadata=merged_metadata))
@@ -954,6 +996,240 @@ class RAGService:
             "session_id": session_id,
         }
 
+    # ------------------------------------------------------------------
+    # Split-phase helpers for the async ingest endpoint
+    # ------------------------------------------------------------------
+
+    def preflight_check(
+        self,
+        file_path: str,
+        metadata: Optional[dict] = None,
+        force: bool = False,
+    ) -> dict:
+        """Run fast pre-flight checks and write the 'processing' DB row.
+
+        Covers Stage 1 (validation) and the deduplication hash check.
+        Heavy work (parsing, embedding) is NOT performed here.
+
+        Returns
+        -------
+        dict with ``status`` one of:
+
+        ``"ready"``
+            Checks passed.  DB row written with ``status="processing"``.
+            Caller should invoke :meth:`run_pipeline` in a background task.
+            Extra keys: ``document_id``, ``file_hash``, ``filename``,
+            ``document_type``, ``user_id``, ``session_id``.
+
+        ``"duplicate"``
+            File already ingested and ``force=False``.
+            Keys mirror those returned by :meth:`ingest_file`.
+
+        ``"failed"``
+            Validation error.  ``error`` key contains the message.
+        """
+        meta = metadata or {}
+        original_filename = meta.get("filename", os.path.basename(file_path))
+        user_id = meta.get("user_id", "default_user")
+        session_id = meta.get("session_id", "default")
+        ext = os.path.splitext(original_filename)[1].lstrip(".").lower()
+
+        # Stage 1 — Validation
+        try:
+            self._validate(file_path, original_filename)
+        except ValueError as exc:
+            return {
+                "status": "failed",
+                "document_id": None,
+                "chunks_added": 0,
+                "filename": original_filename,
+                "document_type": ext,
+                "user_id": user_id,
+                "session_id": session_id,
+                "error": str(exc),
+            }
+
+        # Deduplication
+        file_hash = self._compute_file_hash(file_path)
+        existing = self._find_existing(file_hash, user_id)
+
+        if existing and not force:
+            return {
+                "status": "duplicate",
+                "document_id": existing.document_id,
+                "chunks_added": 0,
+                "filename": original_filename,
+                "document_type": ext,
+                "user_id": user_id,
+                "session_id": session_id,
+                "duplicate_of": existing.filename,
+                "originally_ingested_at": existing.ingested_at.isoformat(),
+            }
+
+        if existing and force:
+            logger.info(
+                "Force re-ingestion requested for '%s' (document_id=%s). "
+                "Deleting %d old vectors.",
+                original_filename,
+                existing.document_id,
+                existing.chunk_count,
+            )
+            self._delete_vectors_for_document(existing.document_id)
+            from app.services.database import db_service
+            try:
+                with Session(db_service.engine) as db:
+                    record = db.get(IngestedDocument, existing.id)
+                    if record:
+                        db.delete(record)
+                        db.commit()
+            except Exception as exc:
+                logger.warning("Could not remove old DB record for force re-ingest: %s", exc)
+
+        # Allocate stable document_id and write a "processing" placeholder
+        document_id = uuid.uuid4().hex
+        self._upsert_db_record(
+            document_id=document_id,
+            filename=original_filename,
+            file_hash=file_hash,
+            user_id=user_id,
+            session_id=session_id,
+            document_type=ext,
+            chunk_count=0,
+            status="processing",
+        )
+
+        return {
+            "status": "ready",
+            "document_id": document_id,
+            "file_hash": file_hash,
+            "filename": original_filename,
+            "document_type": ext,
+            "user_id": user_id,
+            "session_id": session_id,
+        }
+
+    def run_pipeline(
+        self,
+        file_path: str,
+        metadata: Optional[dict] = None,
+        document_id: Optional[str] = None,
+        file_hash: Optional[str] = None,
+    ) -> dict:
+        """Run the heavy pipeline stages (2–8) for a pre-flighted document.
+
+        Intended to be called from a background thread/task after
+        :meth:`preflight_check` has returned ``status="ready"``.
+        Updates the DB row to ``"ingested"`` on success or ``"failed"`` on
+        any exception, so :meth:`get_document` reflects the final state.
+
+        Parameters
+        ----------
+        file_path:
+            Path to the (still-present) temp file on disk.
+        metadata:
+            Same dict passed to :meth:`preflight_check`.
+        document_id:
+            The UUID allocated by :meth:`preflight_check`.
+        file_hash:
+            The SHA-256 hash computed by :meth:`preflight_check` (avoids
+            re-hashing the file a second time).
+
+        Returns
+        -------
+        dict with keys matching those of :meth:`ingest_file`
+        (``status="ingested"`` or ``status="failed"``).
+        """
+        meta = metadata or {}
+        original_filename = meta.get("filename", os.path.basename(file_path))
+        user_id = meta.get("user_id", "default_user")
+        session_id = meta.get("session_id", "default")
+        ext = os.path.splitext(original_filename)[1].lstrip(".").lower()
+        created_at = datetime.now(timezone.utc).isoformat()
+
+        try:
+            # Stage 2 — Parsing
+            documents = self._parse(file_path, ext)
+
+            # Stage 3 — Cleaning
+            documents = self._clean(documents)
+            documents = [d for d in documents if d.page_content.strip()]
+            if not documents:
+                raise ValueError("No extractable text content found in file.")
+
+            # Stage 4 — Structure Detection
+            documents = self._detect_structure(documents)
+
+            # Stage 5 — Metadata Extraction
+            documents = self._extract_metadata(
+                documents,
+                document_id=document_id,
+                user_id=user_id,
+                session_id=session_id,
+                filename=original_filename,
+                document_type=ext,
+                file_hash=file_hash,
+                created_at=created_at,
+            )
+
+            # Stage 6 — Intelligent Chunking
+            chunks = self._chunk(documents)
+
+            # Stages 7 & 8 — Embedding + Vector Storage
+            if chunks:
+                self.vector_store.add_documents(chunks)
+
+        except Exception as exc:
+            error_msg = str(exc)
+            logger.error("Background ingestion failed for '%s': %s", original_filename, error_msg)
+            self._upsert_db_record(
+                document_id=document_id,
+                filename=original_filename,
+                file_hash=file_hash,
+                user_id=user_id,
+                session_id=session_id,
+                document_type=ext,
+                chunk_count=0,
+                status="failed",
+                error_message=error_msg,
+            )
+            return {
+                "status": "failed",
+                "document_id": document_id,
+                "chunks_added": 0,
+                "filename": original_filename,
+                "document_type": ext,
+                "user_id": user_id,
+                "session_id": session_id,
+                "error": error_msg,
+            }
+
+        self._upsert_db_record(
+            document_id=document_id,
+            filename=original_filename,
+            file_hash=file_hash,
+            user_id=user_id,
+            session_id=session_id,
+            document_type=ext,
+            chunk_count=len(chunks),
+            status="ingested",
+        )
+
+        logger.info(
+            "Background ingestion complete: '%s' -> document_id=%s, %d chunks",
+            original_filename,
+            document_id,
+            len(chunks),
+        )
+
+        return {
+            "status": "ingested",
+            "document_id": document_id,
+            "chunks_added": len(chunks),
+            "filename": original_filename,
+            "document_type": ext,
+            "user_id": user_id,
+            "session_id": session_id,
+        }
 
     def retrieve_structured(
         self,
@@ -993,7 +1269,9 @@ class RAGService:
         -------
         List[RetrievedChunk]
             Ordered best-first list (at most ``top_k`` items).
-            Returns an empty list if the vector store has no relevant content.
+            Chunks scoring below ``MIN_RERANK_SCORE`` (when reranking is on) or
+            ``MIN_RRF_SCORE`` (when reranking is off) are excluded.
+            Returns an empty list when no chunk clears the minimum threshold.
         """
         t0 = time.perf_counter()
 
@@ -1056,6 +1334,12 @@ class RAGService:
                 logger.warning("[retrieve_structured] Sparse search failed: %s", exc)
 
         # ── 3. RRF fusion ────────────────────────────────────────────────────
+        # Build a lookup of raw dense scores so we can always populate dense_score
+        # on RetrievedChunk regardless of hybrid mode.
+        dense_score_by_id: Dict[str, float] = {
+            str(hit.id): hit.score for hit in dense_hits
+        }
+
         fused: dict = {}
 
         def _apply_rrf(hits, weight: float) -> None:
@@ -1063,21 +1347,34 @@ class RAGService:
                 pid = str(hit.id)
                 score = weight * (1.0 / (rank + 60))
                 if pid not in fused:
-                    fused[pid] = {"payload": hit.payload, "rrf_score": 0.0, "point_id": pid}
-                fused[pid]["rrf_score"] += score
+                    fused[pid] = {
+                        "payload": hit.payload,
+                        "fusion_score": 0.0,
+                        "dense_score": dense_score_by_id.get(pid, 0.0),
+                        "point_id": pid,
+                    }
+                fused[pid]["fusion_score"] += score
 
         if is_hybrid:
             _apply_rrf(dense_hits, dense_weight)
             _apply_rrf(sparse_hits, sparse_weight)
         else:
+            # Non-hybrid: no RRF — store raw dense cosine similarity directly.
+            # fusion_score is left as None to signal that hybrid was not active.
             for hit in dense_hits:
                 fused[str(hit.id)] = {
                     "payload": hit.payload,
-                    "rrf_score": hit.score,
+                    "fusion_score": None,
+                    "dense_score": hit.score,
                     "point_id": str(hit.id),
                 }
 
-        sorted_candidates = sorted(fused.values(), key=lambda x: x["rrf_score"], reverse=True)
+        # Sort by fusion_score in hybrid mode, dense_score otherwise
+        sorted_candidates = sorted(
+            fused.values(),
+            key=lambda x: x["fusion_score"] if x["fusion_score"] is not None else x["dense_score"],
+            reverse=True,
+        )
         initial_candidates = len(sorted_candidates)
 
         # ── 4. Reranking stage ───────────────────────────────────────────────
@@ -1116,6 +1413,51 @@ class RAGService:
                 )
                 final_items = sorted_candidates[:_top_k]
 
+        # ── 4b. Minimum-relevance cutoff ─────────────────────────────────────
+        # Each branch compares against the score that was used for ranking so
+        # the threshold is always in the same numeric range as the setting.
+        if reranker_used:
+            min_score = getattr(settings, "MIN_RERANK_SCORE", 0.1)
+            pre_filter = len(final_items)
+            final_items = [
+                item for item in final_items
+                if rerank_scores.get(item["point_id"], 0.0) >= min_score
+            ]
+            if len(final_items) < pre_filter:
+                logger.info(
+                    "[retrieve_structured] Score cutoff (MIN_RERANK_SCORE=%.3f) dropped "
+                    "%d/%d chunks.",
+                    min_score, pre_filter - len(final_items), pre_filter,
+                )
+        elif is_hybrid:
+            # Hybrid without reranking: compare fusion (RRF) score
+            min_score = getattr(settings, "MIN_RRF_SCORE", 0.005)
+            pre_filter = len(final_items)
+            final_items = [
+                item for item in final_items
+                if (item["fusion_score"] or 0.0) >= min_score
+            ]
+            if len(final_items) < pre_filter:
+                logger.info(
+                    "[retrieve_structured] Score cutoff (MIN_RRF_SCORE=%.4f) dropped "
+                    "%d/%d chunks.",
+                    min_score, pre_filter - len(final_items), pre_filter,
+                )
+        else:
+            # Dense-only without reranking: compare raw cosine similarity
+            min_score = getattr(settings, "MIN_DENSE_SCORE", 0.3)
+            pre_filter = len(final_items)
+            final_items = [
+                item for item in final_items
+                if item["dense_score"] >= min_score
+            ]
+            if len(final_items) < pre_filter:
+                logger.info(
+                    "[retrieve_structured] Score cutoff (MIN_DENSE_SCORE=%.3f) dropped "
+                    "%d/%d chunks.",
+                    min_score, pre_filter - len(final_items), pre_filter,
+                )
+
         # ── 5. Build RetrievedChunk objects ──────────────────────────────────
         latency_ms = (time.perf_counter() - t0) * 1000.0
         chunks: List[RetrievedChunk] = []
@@ -1134,18 +1476,23 @@ class RAGService:
                 chunk_id=meta.get("chunk_id", ""),
                 chunk_index=meta.get("chunk_index", 0),
                 source=meta.get("source", meta.get("filename", "")),
-                rrf_score=item["rrf_score"],
+                dense_score=item["dense_score"],
+                fusion_score=item["fusion_score"],  # None when hybrid search is off
                 rerank_score=rs,
                 retrieval_latency_ms=latency_ms,
             )
             chunks.append(chunk)
 
         # ── 6. Telemetry log ─────────────────────────────────────────────────
-        final_scores = [
-            round(c.rerank_score, 3) if c.rerank_score is not None
-            else round(c.rrf_score, 4)
-            for c in chunks
-        ]
+        def _primary_score(c: RetrievedChunk) -> float:
+            """Return the most informative score for logging purposes."""
+            if c.rerank_score is not None:
+                return round(c.rerank_score, 3)
+            if c.fusion_score is not None:
+                return round(c.fusion_score, 4)
+            return round(c.dense_score, 4)
+
+        final_scores = [_primary_score(c) for c in chunks]
         logger.info(
             "[Retrieval Diagnostics] latency=%.1fms | candidate_k=%d | "
             "initial_candidates=%d | final_chunks=%d | reranker=%s | scores=%s",
@@ -1231,6 +1578,36 @@ class RAGService:
         except Exception as exc:
             logger.warning("Failed to list ingested documents: %s", exc)
             return []
+
+    def has_documents(self, user_id: Optional[str] = None) -> bool:
+        """Return True when at least one successfully ingested document exists.
+
+        Used as a fast pre-check (single indexed COUNT) before the LLM call so
+        the ``retrieve_documents`` tool is only offered when there is actually
+        something in the vector store to retrieve.
+
+        Parameters
+        ----------
+        user_id:
+            When supplied, the count is scoped to that uploader.  When None or
+            empty the check is global (useful for admin or shared corpora).
+        """
+        from app.services.database import db_service
+        from sqlalchemy import func
+
+        try:
+            with Session(db_service.engine) as db:
+                stmt = select(func.count()).select_from(IngestedDocument).where(
+                    IngestedDocument.status == "ingested"
+                )
+                if user_id:
+                    stmt = stmt.where(IngestedDocument.user_id == user_id)
+                count = db.exec(stmt).one()
+                return count > 0
+        except Exception as exc:
+            # On any DB error fall back to True so retrieval is never wrongly blocked.
+            logger.warning("[has_documents] COUNT query failed — assuming True: %s", exc)
+            return True
 
     @staticmethod
     def _doc_to_dict(r: IngestedDocument) -> dict:

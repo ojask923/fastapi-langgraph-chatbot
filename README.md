@@ -18,6 +18,12 @@ Designed for effortless local execution with zero complex dependencies (no exter
 - **💾 Database Persistence (SQLModel / SQLite / PostgreSQL)**:
   - Persistent chat history and session management saved to local `chatbot.db`.
   - Zero-setup SQLite by default, with seamless support for PostgreSQL via `DATABASE_URL`.
+- **📚 Retrieval-Augmented Generation (RAG)**:
+  - Upload `.txt`, `.pdf`, and `.md` documents via API or UI.
+  - Asynchronous, background pipeline for intelligent chunking, deduplication, and vector storage (powered by local Qdrant).
+  - Context-aware retrieval for specific sessions/users.
+- **🔄 Rolling Memory & Summarization**:
+  - Conversation summarization using LangGraph to keep state context within LLM token limits without losing important facts.
 - **🛠️ Built-in Agent Tools (LangGraph)**:
   - Math Evaluator (`calculate`)
   - Real-time Date/Time tool (`get_current_time`)
@@ -98,27 +104,31 @@ DATABASE_URL=sqlite:///./chatbot.db
 ```text
 ├── app/
 │   ├── agent/
-│   │   ├── graph.py       # LangGraph state machine & multi-provider factory
-│   │   └── tools.py       # Math, time, and web search tools
+│   │   ├── graph.py            # LangGraph state machine & multi-provider factory
+│   │   └── tools.py            # Math, time, and web search tools
 │   ├── api/
-│   │   └── routes.py      # FastAPI chat, stream, history & session endpoints
-│   ├── models/            # Database Models (SQLModel)
-│   │   ├── session.py     # ChatSession table
-│   │   └── message.py     # ChatMessage table
-│   ├── services/          # Services Layer
-│   │   ├── database.py    # Database connection & CRUD operations
-│   │   └── memory.py      # Mem0 user preferences & long-term memory
-│   ├── static/            # Modern Web Chat UI
-│   │   ├── index.html     # HTML Layout
-│   │   ├── style.css      # Glassmorphism styling & animations
-│   │   └── app.js         # SSE streaming & database-synced session manager
-│   └── config.py          # Pydantic environment configuration
-├── chatbot.db             # Local SQLite database file (auto-generated)
-├── main.py                # FastAPI app initialization & database lifespan
-├── start.py               # Launcher script with auto browser popup
-├── run.bat                # Windows 1-click batch launcher
-├── requirements.txt       # Dependencies
-└── .env                   # Environment config
+│   │   ├── routes.py           # FastAPI chat, stream, history & session endpoints
+│   │   └── rag_routes.py       # RAG document ingestion & retrieval admin endpoints
+│   ├── models/                 # Database Models (SQLModel)
+│   │   ├── session.py          # ChatSession table
+│   │   └── message.py          # ChatMessage table
+│   ├── services/               # Services Layer
+│   │   ├── database.py         # Database connection & CRUD operations
+│   │   ├── memory.py           # Mem0 user preferences & long-term memory
+│   │   ├── rag_service.py      # Document parsing, chunking, and vector embedding
+│   │   ├── summarizer.py       # Rolling conversation compactor for AgentState
+│   │   ├── context_engine.py   # Advanced context retrieval logic
+│   │   ├── query_rewriter.py   # Query rewriting for optimal vector search
+│   │   └── qdrant_shared.py    # Qdrant client connection handling
+│   ├── static/                 # Modern Web Chat UI
+│   │   ├── index.html          # HTML Layout
+│   │   ├── style.css           # Glassmorphism styling & animations
+│   │   └── app.js              # SSE streaming & database-synced session manager
+│   └── config.py               # Pydantic environment configuration
+├── chatbot.db                  # Local SQLite database file (auto-generated)
+├── main.py                     # FastAPI app initialization & database lifespan
+├── start.py                    # Launcher script with auto browser popup
+├── run.bat                     # Windows 1-click batch launcher
+├── requirements.txt            # Dependencies
+└── .env                        # Environment config
 ```
-
-

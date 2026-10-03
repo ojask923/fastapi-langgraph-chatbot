@@ -29,6 +29,7 @@ from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
     SystemMessage,
+    RemoveMessage,
 )
 
 from app.config import settings
@@ -127,7 +128,7 @@ class ConversationSummarizer:
                 SystemMessage(content=_SUMMARY_SYSTEM_PROMPT),
                 HumanMessage(content=transcript_text),
             ]
-            response = await summary_llm.ainvoke(summary_input)
+            response = await summary_llm.ainvoke(summary_input, config={"tags": ["internal"]})
             new_summary_text = response.content
             if isinstance(new_summary_text, list):
                 new_summary_text = " ".join(
@@ -148,7 +149,7 @@ class ConversationSummarizer:
 
         return {
             "summary": new_summary,
-            "messages": to_keep,
+            "messages": [RemoveMessage(id=m.id) for m in to_summarize if m.id],
         }
 
 

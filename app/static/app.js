@@ -228,7 +228,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const formData = new FormData();
       formData.append('file', file);
 
-      // Create chip in attachment preview
+      // Show uploading chip
       attachmentPreview.style.display = 'flex';
       attachmentPreview.innerHTML = `
         <div id="upload-chip" style="display: flex; align-items: center; gap: 8px; background: var(--bg-input); border: 1px solid var(--border-color); padding: 6px 12px; border-radius: var(--radius-sm); font-size: 0.85rem;">
@@ -242,7 +242,71 @@ document.addEventListener('DOMContentLoaded', () => {
       uploadDocLabel.style.pointerEvents = 'none';
 
       welcomeHero.style.display = 'none';
-      pendingUpload = null; // reset
+      pendingUpload = null;
+
+      /**
+       * Poll GET /api/rag/documents/{documentId} every 1.5 s until the
+       * status field is "ingested" or "failed", then update the chip.
+       */
+      async function pollIngestStatus(documentId, filename) {
+        const chipText = document.getElementById('upload-chip-text');
+        const chip = document.getElementById('upload-chip');
+        if (chipText) chipText.textContent = `${escapeHtml(filename)} (Processing…)`;
+
+        const MAX_WAIT_MS = 5 * 60 * 1000; // 5-minute safety ceiling
+        const INTERVAL_MS = 1500;
+        const started = Date.now();
+
+        while (Date.now() - started < MAX_WAIT_MS) {
+          await new Promise((r) => setTimeout(r, INTERVAL_MS));
+
+          let poll;
+          try {
+            const res = await fetch(`/api/rag/documents/${documentId}`);
+            if (!res.ok) continue; // transient error — keep polling
+            poll = await res.json();
+          } catch {
+            continue; // network blip — keep polling
+          }
+
+          const status = poll.status;
+
+          if (status === 'ingested') {
+            const chunks = poll.chunk_count ?? 0;
+            if (chipText) chipText.textContent = `${escapeHtml(filename)} (${chunks} chunks ready)`;
+            if (chip) chip.style.borderColor = 'var(--accent-color)';
+
+            pendingUpload = {
+              name: filename,
+              chunks,
+              html: `
+                <div style="display: flex; align-items: center; gap: 10px; background: rgba(255,255,255,0.05); border: 1px solid var(--border-color); padding: 10px 14px; border-radius: var(--radius-md); margin-bottom: 12px; width: fit-content;">
+                  <span style="font-size: 1.5rem;">📄</span>
+                  <div>
+                    <div style="font-weight: 600; font-size: 0.9rem;">${escapeHtml(filename)}</div>
+                    <div style="font-size: 0.75rem; color: var(--text-muted);">Indexed (${chunks} chunks)</div>
+                  </div>
+                </div>
+              `,
+            };
+            return;
+          }
+
+          if (status === 'failed') {
+            const errMsg = poll.error_message || 'Unknown error';
+            if (chipText) chipText.textContent = `${escapeHtml(filename)} (Error: ${escapeHtml(errMsg)})`;
+            if (chip) chip.style.borderColor = '#ef4444';
+            return;
+          }
+          // status is still "processing" — loop and wait
+        }
+
+        // Timed out
+        if (document.getElementById('upload-chip-text'))
+          document.getElementById('upload-chip-text').textContent = `${escapeHtml(filename)} (Timed out — check back later)`;
+        if (document.getElementById('upload-chip'))
+          document.getElementById('upload-chip').style.borderColor = '#f59e0b';
+      }
 
       try {
         const resp = await fetch('/api/rag/ingest', {
@@ -250,49 +314,48 @@ document.addEventListener('DOMContentLoaded', () => {
           body: formData,
         });
 
-        const data = await resp.json();
+        // Safe-parse: some error responses (e.g. unhandled 500s) are plain text.
+        let data;
+        const contentType = resp.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          data = await resp.json();
+        } else {
+          const text = await resp.text();
+          // Try to parse anyway in case the Content-Type header is wrong.
+          try { data = JSON.parse(text); }
+          catch { data = { detail: text || `HTTP ${resp.status}` }; }
+        }
+
         if (!resp.ok) {
-          throw new Error(data.detail?.message || data.detail || 'Failed to ingest document');
+          throw new Error(data.detail?.message || data.detail || `Server error ${resp.status}`);
         }
 
         if (data.status === 'duplicate') {
-            document.getElementById('upload-chip-text').textContent = `${escapeHtml(file.name)} (Already ingested)`;
-            document.getElementById('upload-chip').style.borderColor = 'var(--accent-color)';
-            
-            pendingUpload = {
-              name: file.name,
-              chunks: 0,
-              html: `
-                <div style="display: flex; align-items: center; gap: 10px; background: rgba(255,255,255,0.05); border: 1px solid var(--border-color); padding: 10px 14px; border-radius: var(--radius-md); margin-bottom: 12px; width: fit-content;">
-                  <span style="font-size: 1.5rem;">📄</span>
-                  <div>
-                    <div style="font-weight: 600; font-size: 0.9rem;">${escapeHtml(file.name)}</div>
-                    <div style="font-size: 0.75rem; color: var(--text-muted);">Already in knowledge base</div>
-                  </div>
+          document.getElementById('upload-chip-text').textContent = `${escapeHtml(file.name)} (Already ingested)`;
+          document.getElementById('upload-chip').style.borderColor = 'var(--accent-color)';
+
+          pendingUpload = {
+            name: file.name,
+            chunks: 0,
+            html: `
+              <div style="display: flex; align-items: center; gap: 10px; background: rgba(255,255,255,0.05); border: 1px solid var(--border-color); padding: 10px 14px; border-radius: var(--radius-md); margin-bottom: 12px; width: fit-content;">
+                <span style="font-size: 1.5rem;">📄</span>
+                <div>
+                  <div style="font-weight: 600; font-size: 0.9rem;">${escapeHtml(file.name)}</div>
+                  <div style="font-size: 0.75rem; color: var(--text-muted);">Already in knowledge base</div>
                 </div>
-              `
-            };
-        } else {
-            document.getElementById('upload-chip-text').textContent = `${escapeHtml(file.name)} (${data.chunks_added} chunks ready)`;
-            document.getElementById('upload-chip').style.borderColor = 'var(--accent-color)';
-            
-            pendingUpload = {
-              name: file.name,
-              chunks: data.chunks_added,
-              html: `
-                <div style="display: flex; align-items: center; gap: 10px; background: rgba(255,255,255,0.05); border: 1px solid var(--border-color); padding: 10px 14px; border-radius: var(--radius-md); margin-bottom: 12px; width: fit-content;">
-                  <span style="font-size: 1.5rem;">📄</span>
-                  <div>
-                    <div style="font-weight: 600; font-size: 0.9rem;">${escapeHtml(file.name)}</div>
-                    <div style="font-size: 0.75rem; color: var(--text-muted);">Indexed (${data.chunks_added} chunks)</div>
-                  </div>
-                </div>
-              `
-            };
+              </div>
+            `,
+          };
+        } else if (data.status === 'processing') {
+          // 202 — kick off background poll; UI updates asynchronously
+          pollIngestStatus(data.document_id, file.name);
         }
       } catch (err) {
-        document.getElementById('upload-chip-text').textContent = `${escapeHtml(file.name)} (Error: ${escapeHtml(err.message)})`;
-        document.getElementById('upload-chip').style.borderColor = '#ef4444';
+        const chipEl = document.getElementById('upload-chip-text');
+        const chipWrap = document.getElementById('upload-chip');
+        if (chipEl) chipEl.textContent = `${escapeHtml(file.name)} (Error: ${escapeHtml(err.message)})`;
+        if (chipWrap) chipWrap.style.borderColor = '#ef4444';
       } finally {
         uploadDocLabel.innerHTML = originalHtml;
         uploadDocLabel.style.pointerEvents = 'auto';
@@ -300,6 +363,7 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
   }
+
 
   // Suggestion chips
   document.querySelectorAll('.suggestion-chip').forEach((chip) => {
@@ -410,7 +474,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Prepare Assistant Message Placeholder with live cursor
-    const { bubbleEl, toolContainerEl, rowEl } = createAssistantMessageUI();
+    const { bubbleEl, toolContainerEl, rowEl, sourcesContainerEl } = createAssistantMessageUI();
     isGenerating = true;
     sendBtn.disabled = true;
 
@@ -467,6 +531,11 @@ document.addEventListener('DOMContentLoaded', () => {
               } else if (event.type === 'error') {
                 fullAssistantResponse += `\n\n⚠️ **Error:** ${event.content}`;
                 renderAssistantMarkdown(bubbleEl, fullAssistantResponse, false);
+              } else if (event.type === 'citations') {
+                if (event.citations && event.citations.length > 0) {
+                  renderCitations(sourcesContainerEl, event.citations);
+                  scrollToBottom();
+                }
               } else if (event.type === 'done') {
                 // finished
               }
@@ -546,15 +615,21 @@ document.addEventListener('DOMContentLoaded', () => {
     bubble.className = 'message-bubble bot-bubble';
     bubble.innerHTML = '<span class="typing-cursor"></span>';
 
+    // Placeholder appended after the bubble — renderCitations() will populate it.
+    const sourcesContainer = document.createElement('div');
+    sourcesContainer.className = 'sources-section';
+    sourcesContainer.style.display = 'none';
+
     wrapper.appendChild(toolContainer);
     wrapper.appendChild(bubble);
+    wrapper.appendChild(sourcesContainer);
     row.appendChild(avatar);
     row.appendChild(wrapper);
 
     messagesContainer.appendChild(row);
     scrollToBottom();
 
-    return { bubbleEl: bubble, toolContainerEl: toolContainer, rowEl: row };
+    return { bubbleEl: bubble, toolContainerEl: toolContainer, rowEl: row, sourcesContainerEl: sourcesContainer };
   }
 
   function renderAssistantMarkdown(bubbleEl, text, isTyping) {
@@ -580,6 +655,95 @@ document.addEventListener('DOMContentLoaded', () => {
     } else {
       badge.innerHTML = `<span>✓</span> <span>Used <strong>${toolName}</strong></span>`;
     }
+  }
+
+  /**
+   * Render a "Sources" section below the assistant bubble.
+   *
+   * Each citation becomes a pill; clicking it toggles a collapsible panel
+   * showing the retrieved snippet text plus provenance metadata.
+   *
+   * @param {HTMLElement} container  - The .sources-section div created in createAssistantMessageUI.
+   * @param {Array}       citations  - Array of citation objects from the SSE "citations" event.
+   *   Each object has: index, filename, page_number, section, chunk_id,
+   *                    dense_score, fusion_score, rerank_score.
+   *   The snippet text is carried separately in the ToolMessage content (not
+   *   re-sent in the citation event), so the panel shows provenance only.
+   */
+  function renderCitations(container, citations) {
+    if (!container || !citations || citations.length === 0) return;
+
+    container.innerHTML = '';
+    container.style.display = 'flex';
+
+    // Label row
+    const label = document.createElement('div');
+    label.className = 'sources-label';
+    label.innerHTML = '<span>📚</span> Sources';
+    container.appendChild(label);
+
+    // Pills row
+    const pillsRow = document.createElement('div');
+    pillsRow.className = 'sources-pills';
+    container.appendChild(pillsRow);
+
+    // One snippet wrapper per citation (hidden by default)
+    const snippetWrappers = [];
+
+    citations.forEach((c, i) => {
+      // Build pill label: "filename (p. N)" or just "filename"
+      const pageLabel = c.page_number ? ` · p. ${c.page_number}` : '';
+      const sectionLabel = c.section ? ` · ${c.section}` : '';
+      const pillText = `${escapeHtml(c.filename || 'Unknown')}${pageLabel}`;
+
+      const pill = document.createElement('button');
+      pill.className = 'source-pill';
+      pill.setAttribute('aria-expanded', 'false');
+      pill.innerHTML = `<span class="pill-icon">📄</span>${pillText}`;
+
+      // Snippet wrapper (CSS-animated expand/collapse)
+      const snippetWrapper = document.createElement('div');
+      snippetWrapper.className = 'source-snippet-wrapper';
+
+      // Score display: prefer rerank > fusion > dense
+      const score = c.rerank_score ?? c.fusion_score ?? c.dense_score;
+      const scoreLabel = score != null ? `${(score * 100).toFixed(1)}% relevance` : '';
+
+      const metaParts = [];
+      if (c.page_number) metaParts.push(`<span>📄 Page ${c.page_number}</span>`);
+      if (c.section)     metaParts.push(`<span>§ ${escapeHtml(c.section)}</span>`);
+      if (scoreLabel)    metaParts.push(`<span>🎯 ${scoreLabel}</span>`);
+      if (c.chunk_id)    metaParts.push(`<span style="opacity:0.5">id: ${c.chunk_id}</span>`);
+
+      snippetWrapper.innerHTML = `
+        <div class="source-snippet">
+          <div class="source-snippet-meta">${metaParts.join('') || '&nbsp;'}</div>
+        </div>
+      `;
+
+      // Toggle logic — only one snippet open at a time within this message
+      pill.addEventListener('click', () => {
+        const isOpen = snippetWrapper.classList.contains('open');
+
+        // Close all siblings first
+        snippetWrappers.forEach((sw, j) => {
+          sw.classList.remove('open');
+          pillsRow.querySelectorAll('.source-pill')[j]?.classList.remove('active');
+          pillsRow.querySelectorAll('.source-pill')[j]?.setAttribute('aria-expanded', 'false');
+        });
+
+        if (!isOpen) {
+          snippetWrapper.classList.add('open');
+          pill.classList.add('active');
+          pill.setAttribute('aria-expanded', 'true');
+        }
+        scrollToBottom();
+      });
+
+      snippetWrappers.push(snippetWrapper);
+      pillsRow.appendChild(pill);
+      container.appendChild(snippetWrapper);
+    });
   }
 
   function highlightCodeBlocks(el) {

@@ -60,22 +60,22 @@ _PERSONAL_PRONOUNS: Set[str] = {
 }
 
 _MEMORY_KEYWORDS: Set[str] = {
-    "remember", "forgot", "forget", "recall", "previous", "yesterday", 
-    "earlier", "before", "discuss", "discussed", "told", "said", 
-    "mention", "mentioned", "project", "prefer", "preference", "goal"
+    "remember", "forgot", "forget", "recall", "previous", "yesterday",
+    "earlier", "before", "discuss", "discussed", "told", "said",
+    "mention", "mentioned", "project", "prefer", "preference", "goal",
+    # identity / personal-info queries
+    "name", "about", "know", "who", "what",
 }
 
 # Keywords that strongly suggest long-term-worthy content
 _STORE_INDICATORS: List[str] = [
     "my name is", "i am called", "call me",
-    "i am ", "i'm ",
     "i live in", "i'm from", "i work at", "i work as", "i work for",
-    "i prefer", "i like", "i love", "i hate", "i dislike", "i enjoy",
+    "i prefer", "my preference", "i strongly dislike",
     "my goal is", "my project is", "i'm building", "i am building",
     "remember that", "remember this", "don't forget", "keep in mind",
     "always use", "never use", "please always", "please never",
     "my favourite", "my favorite",
-    "i usually", "i always", "i never",
     "my email", "my phone", "my address",
     "i was born", "i'm a ", "i am a ",
     "i study", "i'm studying", "i graduated",
@@ -145,50 +145,67 @@ class MemoryService:
             if self._initialized:
                 return
 
-            provider = settings.DEFAULT_PROVIDER.lower()
+            # Use MEM0_LLM_PROVIDER (decoupled from DEFAULT_PROVIDER) so
+            # memory extraction always uses a reliable, high-TPM model.
+            mem0_provider = settings.MEM0_LLM_PROVIDER.lower()
 
             def _blocking_init():
                 """Runs synchronously in a thread — safe to call blocking loaders here."""
                 from mem0 import AsyncMemory  # noqa: PLC0415
 
                 llm_config: Dict[str, Any] = {}
-                if provider == "groq":
+                if mem0_provider == "groq":
                     llm_config = {
                         "provider": "groq",
                         "config": {
-                            "model": settings.DEFAULT_MODEL,
+                            "model": settings.MEM0_LLM_MODEL,
                             "api_key": settings.GROQ_API_KEY,
-                            "max_tokens": 500,
+                            "max_tokens": 2000,
                         },
                     }
-                elif provider == "openai":
+                elif mem0_provider == "openai":
                     llm_config = {
                         "provider": "openai",
                         "config": {
-                            "model": settings.DEFAULT_MODEL or "gpt-4o-mini",
+                            "model": settings.MEM0_LLM_MODEL,
                             "api_key": settings.OPENAI_API_KEY,
                         },
                     }
-                elif provider == "anthropic":
+                elif mem0_provider == "anthropic":
                     llm_config = {
                         "provider": "anthropic",
                         "config": {
-                            "model": settings.DEFAULT_MODEL or "claude-3-5-haiku-20241022",
+                            "model": settings.MEM0_LLM_MODEL,
                             "api_key": settings.ANTHROPIC_API_KEY,
+                        },
+                    }
+                elif mem0_provider == "gemini":
+                    llm_config = {
+                        "provider": "gemini",
+                        "config": {
+                            "model": settings.MEM0_LLM_MODEL,
+                            "api_key": settings.GEMINI_API_KEY,
                         },
                     }
                 else:
                     llm_config = {
                         "provider": "ollama",
-                        "config": {"model": settings.DEFAULT_MODEL},
+                        "config": {"model": settings.MEM0_LLM_MODEL},
                     }
+
+                from app.services.qdrant_shared import get_qdrant_client, get_hf_embeddings  # noqa: PLC0415
+
+                # Reuse the shared QdrantClient — avoids a second exclusive
+                # file lock on the embedded Qdrant data directory and avoids
+                # loading all-MiniLM-L6-v2 a second time.
+                shared_client = get_qdrant_client()
 
                 cfg = {
                     "vector_store": {
                         "provider": "qdrant",
                         "config": {
                             "collection_name": "user_memories_hf",
-                            "path": "./qdrant_mem0_data",
+                            "client": shared_client,
                             "embedding_model_dims": 384,
                         },
                     },
@@ -206,7 +223,7 @@ class MemoryService:
                     _mem0_executor, _blocking_init
                 )
                 self._use_mem0 = True
-                print(f"[INFO] mem0 initialized using {provider} for long-term memory (Qdrant).")
+                print(f"[INFO] mem0 initialized using {mem0_provider} for long-term memory (Qdrant).")
             except Exception as e:
                 print(f"[WARNING] Could not initialize mem0, using DB fallback for management only: {e}")
                 self._use_mem0 = False
@@ -242,7 +259,7 @@ class MemoryService:
             results = await self._mem0_instance.search(
                 query=query,
                 filters={"user_id": str(user_id)},
-                limit=settings.MEM0_MAX_RESULTS,
+                top_k=settings.MEM0_MAX_RESULTS,
             )
             if results and isinstance(results, dict) and "results" in results:
                 items = results["results"][: settings.MEM0_MAX_RESULTS]
@@ -284,13 +301,6 @@ class MemoryService:
 
         if self._use_mem0 and self._mem0_instance:
             try:
-                import mem0.configs.prompts
-                mem0.configs.prompts.ADDITIVE_EXTRACTION_PROMPT = (
-                    "Extract personal facts and preferences from the user.\n"
-                    "Return ONLY valid JSON matching this exact structure:\n"
-                    "{\"memory\": [{\"id\": \"0\", \"text\": \"fact\", \"attributed_to\": \"user\"}]}\n"
-                    "If nothing is found, return {\"memory\": []}."
-                )
                 await self._mem0_instance.add(
                     messages, user_id=str(user_id), metadata=metadata
                 )

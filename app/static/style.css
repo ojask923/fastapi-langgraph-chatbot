@@ -893,3 +893,104 @@ select.form-control option {
     display: flex;
   }
 }
+
+/* ==============================================================================
+   Citation / Sources Section
+   ============================================================================== */
+
+.sources-section {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sources-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.sources-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.source-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border-color);
+  background: var(--bg-card);
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: border-color 0.18s ease, color 0.18s ease, background 0.18s ease;
+  user-select: none;
+}
+
+.source-pill:hover {
+  border-color: var(--accent-color);
+  color: var(--text-primary);
+  background: var(--bg-card-hover);
+}
+
+.source-pill.active {
+  border-color: var(--accent-color);
+  color: var(--accent-color);
+  background: var(--accent-glow);
+}
+
+.source-pill .pill-icon {
+  font-size: 0.8rem;
+  opacity: 0.8;
+}
+
+.source-snippet-wrapper {
+  overflow: hidden;
+  max-height: 0;
+  transition: max-height 0.28s ease, opacity 0.2s ease;
+  opacity: 0;
+}
+
+.source-snippet-wrapper.open {
+  max-height: 300px;
+  opacity: 1;
+}
+
+.source-snippet {
+  margin-top: 4px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--accent-color);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--bg-card);
+  font-size: 0.78rem;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.source-snippet-meta {
+  margin-top: 6px;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.source-snippet-meta span {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+

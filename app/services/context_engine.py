@@ -13,14 +13,16 @@ Uses tiktoken for accurate token counting against provider limits.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Dict, List, Optional, Sequence
 
 from langchain_core.messages import (
+    AIMessage,
     BaseMessage,
     SystemMessage,
 )
-import tiktoken
+from langchain_core.messages.utils import trim_messages
 
 from app.config import settings
 
@@ -31,57 +33,69 @@ logger = logging.getLogger(__name__)
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+# Lazy singleton — loaded on first call to avoid a network fetch at import time.
+_tokenizer = None
 
-# Initialize tokenizer once for the module
-_tokenizer = tiktoken.get_encoding("cl100k_base")
+
+def _get_tokenizer():
+    """Return the tiktoken encoder, initialising it lazily.
+
+    Falls back to None if the BPE data cannot be fetched (e.g. no internet),
+    in which case callers use the len(text)//4 heuristic.
+    """
+    global _tokenizer
+    if _tokenizer is not None:
+        return _tokenizer
+    try:
+        import tiktoken
+        _tokenizer = tiktoken.get_encoding("cl100k_base")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[ContextEngine] tiktoken unavailable — using len//4 heuristic. Reason: %s", exc
+        )
+        _tokenizer = False  # sentinel: tried and failed
+    return _tokenizer
+
+
+def _encode_text(text: str) -> int:
+    """Return token count for a plain string, using tiktoken or the heuristic."""
+    enc = _get_tokenizer()
+    if enc:
+        return len(enc.encode(text))
+    return max(1, len(text) // 4)
 
 
 def _count_tokens(messages: List[BaseMessage]) -> int:
-    """Accurate token-count estimate for a list of messages."""
+    """Token-count estimate for a list of messages.
+
+    Accounts for:
+    * ``content`` — str or list-of-dicts (multi-part / tool-use blocks)
+    * ``tool_calls`` on AIMessage — serialised as JSON so tool-heavy turns
+      are not silently undercounted against the context budget.
+    """
     total = 0
     for m in messages:
         content = m.content
-        text_to_encode = ""
         if isinstance(content, str):
-            text_to_encode = content
+            total += _encode_text(content)
         elif isinstance(content, list):
             for part in content:
                 if isinstance(part, dict):
-                    text_to_encode += str(part.get("text", ""))
-        
-        if text_to_encode:
-            total += len(_tokenizer.encode(text_to_encode))
+                    total += _encode_text(str(part.get("text", "")))
+
+        # Include tool_calls payload (present on AIMessage when tools are invoked)
+        if isinstance(m, AIMessage) and m.tool_calls:
+            try:
+                total += _encode_text(json.dumps(m.tool_calls))
+            except Exception:  # noqa: BLE001
+                total += _encode_text(str(m.tool_calls))
+
     return total
 
 
-def _trim_to_budget(
-    messages: List[BaseMessage],
-    budget_tokens: int,
-    keep_first: int = 1,
-) -> List[BaseMessage]:
-    """Drop the oldest *middle* messages until the total fits within budget_tokens.
-
-    The first *keep_first* messages (e.g. SystemMessage) and the very last
-    message (current query) are always preserved.
-    """
-    if _count_tokens(messages) <= budget_tokens:
-        return messages
-
-    protected_head = messages[:keep_first]
-    protected_tail = messages[-1:]
-    middle = list(messages[keep_first:-1])
-
-    while middle and _count_tokens(protected_head + middle + protected_tail) > budget_tokens:
-        middle.pop(0)  # drop the oldest middle message first
-
-    trimmed = protected_head + middle + protected_tail
-    logger.debug(
-        "[ContextEngine] Context trimmed: %d -> %d messages to fit %d-token budget",
-        len(messages),
-        len(trimmed),
-        budget_tokens,
-    )
-    return trimmed
+def _count_tokens_for_trim(messages: List[BaseMessage]) -> int:
+    """Token counter compatible with trim_messages() signature (accepts a list)."""
+    return _count_tokens(messages)
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +136,14 @@ class ContextEngine:
         # --- 1. Build the composite system block ----------------------------
         system_parts: List[str] = [
             system_instructions.strip(),
-            "\nIMPORTANT INSTRUCTIONS:\n- Do NOT output raw internal citation tags like `【retrieve_documents†source=1】`. Integrate the information naturally into your answer instead."
+            (
+                "\nIMPORTANT INSTRUCTIONS:\n"
+                "- Do NOT output raw internal citation tags like `【retrieve_documents†source=1】`. "
+                "Integrate the information naturally into your answer instead.\n"
+                "- If the user asks about themselves (their name, preferences, history, goals, etc.), "
+                "answer using the <long_term_memory> context block below. "
+                "Do NOT call retrieve_documents or search_web for personal user information."
+            )
         ]
 
         if conversation_summary:
@@ -171,27 +192,24 @@ class ContextEngine:
             m for m in messages if not isinstance(m, SystemMessage)
         ]
 
-        # --- 3. Apply the configurable message window -----------------------
-        window = settings.RECENT_MESSAGES_WINDOW
-        windowed = (
-            filtered_messages[-window:]
-            if len(filtered_messages) > window
-            else filtered_messages
+        # --- 3 & 5. Window + token budget via trim_messages (tool-call aware) -
+        # trim_messages keeps the most-recent messages, always starts on a
+        # HumanMessage boundary, and never splits an AIMessage/ToolMessage pair.
+        windowed = trim_messages(
+            filtered_messages,
+            strategy="last",
+            token_counter=_count_tokens_for_trim,
+            max_tokens=settings.CONTEXT_TOKEN_BUDGET,
+            start_on="human",
+            include_system=False,
         )
 
         # --- 4. Assemble the final list ------------------------------------
         final_messages: List[BaseMessage] = [system_msg] + windowed
 
-        # --- 5. Enforce the token budget ------------------------------------
-        final_messages = _trim_to_budget(
-            final_messages,
-            budget_tokens=settings.CONTEXT_TOKEN_BUDGET,
-            keep_first=1,  # always preserve the SystemMessage
-        )
-
         logger.debug(
             "[ContextEngine] Context built: system=%d tokens | recent=%d msgs | total=%d tokens",
-            len(_tokenizer.encode(system_content)),
+            _encode_text(system_content),
             len(windowed),
             _count_tokens(final_messages),
         )

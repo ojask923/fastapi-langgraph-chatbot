@@ -36,8 +36,35 @@ from app.services.database import db_service
 from app.services.context_engine import context_engine
 from app.services.summarizer import summarizer
 from app.services.llm_factory import get_llm
+from app.services.rag_service import rag_service  # for has_documents pre-check
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Background-task helper
+# ---------------------------------------------------------------------------
+
+# Module-level set keeps references alive so the GC never collects running tasks.
+_background_tasks: set = set()
+
+
+def _fire_and_forget(coro) -> None:
+    """Schedule a coroutine as a fire-and-forget background task.
+
+    Holds a strong reference to the task until it completes so Python's GC
+    cannot collect it mid-execution.  Any exception is logged rather than
+    silently swallowed.
+    """
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+
+    def _on_done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        exc = t.exception() if not t.cancelled() else None
+        if exc:
+            logger.warning("[background task] %s raised: %s", t.get_name(), exc)
+
+    task.add_done_callback(_on_done)
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +115,7 @@ class ChatAgent:
         self._checkpointer_ready = False
         self._checkpointer_error: Optional[str] = None
         self._pool = None
+        self._init_lock = asyncio.Lock()  # guards _ensure_checkpointer against concurrent callers
         self.tools = get_available_tools()
         self._compiled_graphs: Dict[str, Any] = {}
 
@@ -96,53 +124,84 @@ class ChatAgent:
     # ------------------------------------------------------------------
 
     async def _ensure_checkpointer(self) -> None:
-        """Initialise PostgresSaver (or fall back to MemorySaver) exactly once."""
+        """Initialise the checkpointer exactly once, safe against concurrent callers.
+
+        Uses double-checked locking (mirroring MemoryService._init_lock) so that
+        two concurrent first requests cannot both pass the ready-check and each
+        create their own AsyncConnectionPool, leaking one.
+        """
         if self._checkpointer_ready:
             return
 
-        db_url = settings.DATABASE_URL
-        is_postgres = db_url.startswith(("postgresql://", "postgresql+", "postgres://"))
+        async with self._init_lock:
+            # Second check inside the lock: another coroutine may have finished
+            # initialisation while we waited to acquire it.
+            if self._checkpointer_ready:
+                return
 
-        if is_postgres:
-            try:
-                import psycopg
-                from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-                from psycopg_pool import AsyncConnectionPool
+            db_url = settings.DATABASE_URL
+            is_postgres = db_url.startswith(("postgresql://", "postgresql+", "postgres://"))
 
-                conn_string = _build_pg_conn_string(db_url)
+            if is_postgres:
+                try:
+                    import psycopg
+                    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+                    from psycopg_pool import AsyncConnectionPool
 
-                async with await psycopg.AsyncConnection.connect(
-                    conn_string, autocommit=True
-                ) as setup_conn:
-                    await AsyncPostgresSaver(setup_conn).setup()
+                    conn_string = _build_pg_conn_string(db_url)
 
-                self._pool = AsyncConnectionPool(
-                    conninfo=conn_string,
-                    min_size=1,
-                    max_size=10,
-                    open=False,
-                )
-                await self._pool.open(wait=True, timeout=10)
-                self.checkpointer = AsyncPostgresSaver(self._pool)
-                self._checkpointer_error = None
-                logger.info("[Checkpointer] PostgresSaver ready — checkpoints persist across restarts.")
-                print("[INFO] LangGraph checkpointer: PostgresSaver (persistent across restarts).")
-            except Exception as exc:
-                import traceback
-                self._checkpointer_error = f"{type(exc).__name__}: {exc}"
-                logger.warning(
-                    "[Checkpointer] PostgresSaver init failed — falling back to MemorySaver.\n%s",
-                    traceback.format_exc(),
-                )
-                print("[WARNING] PostgresSaver FAILED — using MemorySaver fallback.")
-                print(f"[WARNING] Error: {type(exc).__name__}: {exc}")
-                self.checkpointer = MemorySaver()
-        else:
-            print("[INFO] LangGraph checkpointer: MemorySaver (SQLite mode — no cross-restart persistence).")
-            self.checkpointer = MemorySaver()
+                    async with await psycopg.AsyncConnection.connect(
+                        conn_string, autocommit=True
+                    ) as setup_conn:
+                        await AsyncPostgresSaver(setup_conn).setup()
 
-        self._checkpointer_ready = True
-        self._compiled_graphs.clear()
+                    self._pool = AsyncConnectionPool(
+                        conninfo=conn_string,
+                        min_size=1,
+                        max_size=10,
+                        open=False,
+                    )
+                    await self._pool.open(wait=True, timeout=10)
+                    self.checkpointer = AsyncPostgresSaver(self._pool)
+                    self._checkpointer_error = None
+                    logger.info("[Checkpointer] PostgresSaver ready — checkpoints persist across restarts.")
+                    print("[INFO] LangGraph checkpointer: PostgresSaver (persistent across restarts).")
+                except Exception as exc:
+                    import traceback
+                    self._checkpointer_error = f"{type(exc).__name__}: {exc}"
+                    logger.warning(
+                        "[Checkpointer] PostgresSaver init failed — falling back to MemorySaver.\n%s",
+                        traceback.format_exc(),
+                    )
+                    print("[WARNING] PostgresSaver FAILED — using MemorySaver fallback.")
+                    print(f"[WARNING] Error: {type(exc).__name__}: {exc}")
+                    self.checkpointer = MemorySaver()
+            else:
+                # SQLite path — use AsyncSqliteSaver for cross-restart persistence
+                db_path = db_url.replace("sqlite:///", "").replace("sqlite+aiosqlite:///", "")
+                if not db_path:
+                    db_path = "./chatbot.db"
+                try:
+                    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+                    self._sqlite_ctx = AsyncSqliteSaver.from_conn_string(db_path)
+                    self.checkpointer = await self._sqlite_ctx.__aenter__()
+                    self._checkpointer_error = None
+                    logger.info("[Checkpointer] AsyncSqliteSaver ready — checkpoints persist across restarts.")
+                    print(f"[INFO] LangGraph checkpointer: AsyncSqliteSaver ({db_path}) — persistent across restarts.")
+                except Exception as exc:
+                    import traceback
+                    self._checkpointer_error = f"{type(exc).__name__}: {exc}"
+                    logger.warning(
+                        "[Checkpointer] AsyncSqliteSaver init failed — falling back to MemorySaver.\n%s",
+                        traceback.format_exc(),
+                    )
+                    print("[WARNING] AsyncSqliteSaver FAILED — using MemorySaver fallback.")
+                    print(f"[WARNING] Error: {type(exc).__name__}: {exc}")
+                    self.checkpointer = MemorySaver()
+
+            self._checkpointer_ready = True
+            self._compiled_graphs.clear()
 
     # ------------------------------------------------------------------
     # Graph construction
@@ -169,7 +228,20 @@ class ChatAgent:
 
         # ---- agent node ---------------------------------------------------
         async def call_model(state: AgentState, config: RunnableConfig):
-            """Build context via ContextEngine and call the LLM."""
+            """Build context via ContextEngine and call the LLM.
+
+            RAG routing pre-check
+            ---------------------
+            Before building the context we run a fast COUNT query
+            (``rag_service.has_documents``) scoped to the current user.
+
+            * No documents  →  ``retrieve_documents`` is removed from the
+              bound tool list so the model structurally cannot call it.
+            * Documents exist →  a short routing instruction is appended to
+              the system prompt so the model reliably calls
+              ``retrieve_documents`` when the user references an uploaded
+              file, rather than guessing or skipping retrieval.
+            """
             configurable = config.get("configurable", {})
             system_instructions = configurable.get(
                 "system_prompt", "You are a helpful, smart AI assistant."
@@ -177,6 +249,43 @@ class ChatAgent:
             user_id = configurable.get("user_id", "")
 
             messages = state["messages"]
+
+            # ── RAG pre-check ────────────────────────────────────────────────
+            # Runs in a thread so the indexed COUNT never blocks the event loop.
+            user_has_docs = await asyncio.to_thread(
+                rag_service.has_documents, user_id or None
+            )
+
+            if user_has_docs:
+                # (b) Append a compact routing rule to the system instructions
+                # so the model calls retrieve_documents for document questions.
+                system_instructions = (
+                    system_instructions.rstrip()
+                    + "\n\n"
+                    + "DOCUMENT RETRIEVAL RULE:\n"
+                    + "The user has documents in the knowledge base. "
+                    + "ALWAYS call the `retrieve_documents` tool first when the "
+                    + "user's message references \"the document\", \"this file\", "
+                    + "\"what I uploaded\", \"the report\", \"the PDF\", or any "
+                    + "phrasing that implies they want information from an uploaded "
+                    + "file. Do NOT answer document questions from memory alone."
+                )
+                active_tools = self.tools  # full tool list
+            else:
+                # (a) Drop retrieve_documents — nothing to retrieve for this user.
+                active_tools = [
+                    t for t in self.tools if t.name != "retrieve_documents"
+                ]
+
+            # Rebind the LLM with the per-call tool list.
+            # get_llm is cheap after the first call (returns a cached/new instance
+            # with the correct tool binding applied via bind_tools).
+            active_llm = get_llm(
+                configurable.get("provider", provider),
+                configurable.get("model", model),
+                configurable.get("temperature", temperature),
+                tools=active_tools if settings.ENABLE_TOOLS else [],
+            )
 
             # Extract the last HumanMessage's text as the current query for Mem0 search
             current_query = ""
@@ -214,8 +323,8 @@ class ChatAgent:
                 rag_citations=rag_citations,
             )
 
-            response = await llm.ainvoke(final_messages)
-            return {"messages": [response]}
+            response = await active_llm.ainvoke(final_messages)
+            return {"messages": [response], "rag_citations": {}}
 
         # ---- summarize node -----------------------------------------------
         async def maybe_summarize(state: AgentState, config: RunnableConfig):
@@ -299,8 +408,6 @@ class ChatAgent:
         # Only send the new HumanMessage; LangGraph loads prior state from checkpointer
         input_state: Dict[str, Any] = {
             "messages": [HumanMessage(content=message)],
-            "summary": "",
-            "rag_citations": {},
         }
         result = await graph.ainvoke(input_state, config=config)
 
@@ -312,7 +419,7 @@ class ChatAgent:
         content = last_ai_msg.content if last_ai_msg else "No response generated."
 
         # Conditionally store to Mem0 in background (write gate is inside add())
-        asyncio.create_task(
+        _fire_and_forget(
             memory_service.add(
                 user_id=user_id,
                 messages=[
@@ -366,51 +473,61 @@ class ChatAgent:
 
         input_state: Dict[str, Any] = {
             "messages": [HumanMessage(content=message)],
-            "summary": "",
-            "rag_citations": {},
         }
         accumulated_text = ""
 
-        async for event in graph.astream_events(input_state, config=config, version="v2"):
-            kind = event.get("event")
+        try:
+            async for event in graph.astream_events(input_state, config=config, version="v2"):
+                kind = event.get("event")
 
-            if kind == "on_chat_model_stream":
-                tags = event.get("tags", [])
-                if "query_rewriter" in tags:
-                    continue
-                
-                chunk = event["data"].get("chunk")
-                if chunk and chunk.content:
-                    if isinstance(chunk.content, str):
-                        accumulated_text += chunk.content
-                        yield {"type": "token", "content": chunk.content}
-                    elif isinstance(chunk.content, list):
-                        for part in chunk.content:
-                            if isinstance(part, dict) and "text" in part:
-                                accumulated_text += part["text"]
-                                yield {"type": "token", "content": part["text"]}
+                if kind == "on_chat_model_stream":
+                    node = event.get("metadata", {}).get("langgraph_node")
+                    if node != "agent":
+                        continue
+                    
+                    chunk = event["data"].get("chunk")
+                    if chunk and chunk.content:
+                        if isinstance(chunk.content, str):
+                            accumulated_text += chunk.content
+                            yield {"type": "token", "content": chunk.content}
+                        elif isinstance(chunk.content, list):
+                            for part in chunk.content:
+                                if isinstance(part, dict) and "text" in part:
+                                    accumulated_text += part["text"]
+                                    yield {"type": "token", "content": part["text"]}
 
-            elif kind == "on_tool_start":
-                tool_name = event.get("name", "tool")
-                tool_args = event.get("data", {}).get("input", {})
-                yield {"type": "tool_start", "name": tool_name, "args": tool_args}
+                elif kind == "on_tool_start":
+                    tool_name = event.get("name", "tool")
+                    tool_args = event.get("data", {}).get("input", {})
+                    yield {"type": "tool_start", "name": tool_name, "args": tool_args}
 
-            elif kind == "on_tool_end":
-                tool_name = event.get("name", "tool")
-                tool_output = str(event.get("data", {}).get("output", ""))
-                yield {"type": "tool_end", "name": tool_name, "result": tool_output}
+                elif kind == "on_tool_end":
+                    tool_name = event.get("name", "tool")
+                    tool_output = str(event.get("data", {}).get("output", ""))
+                    yield {"type": "tool_end", "name": tool_name, "result": tool_output}
 
-        # Conditionally store to Mem0 in background
-        if accumulated_text:
-            asyncio.create_task(
-                memory_service.add(
-                    user_id=user_id,
-                    messages=[
-                        {"role": "user", "content": message},
-                        {"role": "assistant", "content": accumulated_text},
-                    ],
+        finally:
+            # Always fire mem0 write, even on early client disconnect
+            if accumulated_text:
+                _fire_and_forget(
+                    memory_service.add(
+                        user_id=user_id,
+                        messages=[
+                            {"role": "user", "content": message},
+                            {"role": "assistant", "content": accumulated_text},
+                        ],
+                    )
                 )
-            )
+
+        # Extract and yield citations from the final state
+        final_state = await graph.aget_state(config)
+        raw_citations = final_state.values.get("rag_citations", {})
+        if raw_citations:
+            citations = [
+                {"index": idx, **meta}
+                for idx, meta in raw_citations.items()
+            ]
+            yield {"type": "citations", "citations": citations}
 
         yield {"type": "done"}
 
@@ -423,11 +540,14 @@ class ChatAgent:
             if m.role in ("user", "assistant") and m.content
         ]
 
-    def clear_history(self, session_id: str) -> None:
-        """Clear LangGraph checkpoint rows for a session.
+    async def clear_history(self, session_id: str) -> None:
+        """Clear LangGraph checkpoint rows for a session (async, non-blocking).
 
-        For PostgresSaver: deletes rows from the langgraph checkpoint tables.
-        For MemorySaver:   pops from the in-process dict.
+        Uses the checkpointer's own async delete API so the event loop is never
+        blocked by synchronous psycopg I/O.
+
+        For AsyncPostgresSaver / AsyncSqliteSaver: calls adelete_thread().
+        For MemorySaver: pops from the in-process dict (cheap, no I/O).
         Silently no-ops if the checkpointer has not yet been initialised.
         """
         if not self._checkpointer_ready or self.checkpointer is None:
@@ -441,20 +561,12 @@ class ChatAgent:
                 pass
             return
 
-        # PostgresSaver — delete via a short-lived sync psycopg3 connection
+        # AsyncPostgresSaver / AsyncSqliteSaver — use their own async delete method.
         try:
-            import psycopg
-
-            conn_string = _build_pg_conn_string(settings.DATABASE_URL)
-            with psycopg.connect(conn_string) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("DELETE FROM checkpoints WHERE thread_id = %s", (session_id,))
-                    cur.execute("DELETE FROM checkpoint_blobs WHERE thread_id = %s", (session_id,))
-                    cur.execute("DELETE FROM checkpoint_writes WHERE thread_id = %s", (session_id,))
-                conn.commit()
+            await self.checkpointer.adelete_thread(session_id)
         except Exception as exc:
             logger.warning(
-                "[clear_history] Could not delete Postgres checkpoints for %s: %s",
+                "[clear_history] Could not delete checkpoints for session %s: %s",
                 session_id,
                 exc,
             )

@@ -2,11 +2,12 @@
 
 import asyncio
 import os
-import shutil
 import uuid
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import JSONResponse
 
+from app.config import settings
 from app.services.rag_service import rag_service
 
 router = APIRouter(prefix="/rag", tags=["RAG"])
@@ -34,17 +35,27 @@ async def ingest_document(
 ):
     """Upload a document (.txt, .pdf, or .md) to the RAG vector store.
 
-    Pipeline
-    --------
-    validation → parsing → cleaning → structure detection →
-    metadata extraction → intelligent chunking → embedding → vector storage
+    Returns **202 Accepted** immediately once pre-flight checks pass and the
+    slow pipeline has been scheduled as a background task.
+
+    The caller should poll ``GET /rag/documents/{document_id}`` every 1-2 s
+    until ``status`` transitions to ``"ingested"`` or ``"failed"``.
+
+    Pre-flight (synchronous, fast)
+    --------------------------------
+    * Extension allow-list + file-size validation
+    * SHA-256 deduplication check
+
+    Background pipeline (asynchronous)
+    ------------------------------------
+    parsing -> cleaning -> structure detection ->
+    metadata extraction -> intelligent chunking -> embedding -> vector storage
 
     Deduplication
     -------------
-    The file's SHA-256 hash is checked before any embedding work begins.
-    Uploading an identical file a second time returns ``status="duplicate"``
-    with no re-embedding — unless ``force=true`` is passed, which will delete
-    the old vectors and re-ingest the document entirely.
+    Uploading a byte-identical file a second time returns ``status="duplicate"``
+    immediately (no 202) -- unless ``force=true`` is passed, which deletes the
+    old vectors and re-ingests.
 
     Context fields
     --------------
@@ -56,69 +67,114 @@ async def ingest_document(
     unique_filename = f"{uuid.uuid4().hex}_{safe_filename}"
     temp_file_path = os.path.join(UPLOAD_DIR, unique_filename)
 
+    max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    written = 0
     try:
-        # Save the uploaded file to a temporary location
         with open(temp_file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        # Run the blocking pipeline off the async event loop
-        result = await asyncio.to_thread(
-            rag_service.ingest_file,
-            file_path=temp_file_path,
-            metadata={
-                "filename": safe_filename,
-                "user_id": user_id,
-                "session_id": session_id,
-            },
-            force=force,
-        )
-
+            while chunk := await file.read(1024 * 1024):  # stream 1 MiB at a time
+                written += len(chunk)
+                if written > max_bytes:
+                    # Partial file on disk — remove it before rejecting.
+                    buffer.close()
+                    os.remove(temp_file_path)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"File exceeds the {settings.MAX_UPLOAD_SIZE_MB} MB upload limit. "
+                            "Please upload a smaller file."
+                        ),
+                    )
+                buffer.write(chunk)
+    except HTTPException:
+        raise  # re-raise 413 without wrapping it
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Ingestion error: {exc}") from exc
-
-    finally:
-        # Always clean up the temporary upload file
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
+        raise HTTPException(status_code=500, detail=f"Could not save upload: {exc}") from exc
 
-    status = result.get("status")
+    meta = {"filename": safe_filename, "user_id": user_id, "session_id": session_id}
 
-    if status == "failed":
+    # Synchronous pre-flight (fast: validation + dedup hash)
+    # Runs inline so the caller immediately knows about invalid/duplicate files
+    # without waiting for the embedding pipeline.
+    try:
+        preflight = await asyncio.to_thread(
+            rag_service.preflight_check,
+            file_path=temp_file_path,
+            metadata=meta,
+            force=force,
+        )
+    except Exception as exc:
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        raise HTTPException(status_code=500, detail=f"Pre-flight error: {exc}") from exc
+
+    if preflight["status"] == "failed":
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
         raise HTTPException(
             status_code=422,
             detail={
                 "message": f"Failed to ingest '{safe_filename}'.",
-                "error": result.get("error"),
-                "document_id": result.get("document_id"),
+                "error": preflight.get("error"),
+                "document_id": preflight.get("document_id"),
             },
         )
 
-    if status == "duplicate":
+    if preflight["status"] == "duplicate":
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
         return {
             "message": (
                 f"'{safe_filename}' was already ingested as "
-                f"'{result['duplicate_of']}' on {result['originally_ingested_at']}. "
+                f"'{preflight['duplicate_of']}' on {preflight['originally_ingested_at']}. "
                 "Skipped to avoid duplicate chunks. Pass force=true to re-ingest."
             ),
             "status": "duplicate",
-            "document_id": result["document_id"],
+            "document_id": preflight["document_id"],
             "chunks_added": 0,
-            "duplicate_of": result["duplicate_of"],
-            "originally_ingested_at": result["originally_ingested_at"],
-            "user_id": result["user_id"],
-            "session_id": result["session_id"],
+            "duplicate_of": preflight["duplicate_of"],
+            "originally_ingested_at": preflight["originally_ingested_at"],
+            "user_id": preflight["user_id"],
+            "session_id": preflight["session_id"],
         }
 
-    return {
-        "message": f"Successfully ingested '{safe_filename}'.",
-        "status": "ingested",
-        "document_id": result["document_id"],
-        "chunks_added": result["chunks_added"],
-        "filename": result["filename"],
-        "document_type": result["document_type"],
-        "user_id": result["user_id"],
-        "session_id": result["session_id"],
-    }
+    # preflight["status"] == "ready"
+    # The DB row already has status="processing" (written by preflight_check).
+    document_id = preflight["document_id"]
+
+    # Background pipeline
+    # Fire-and-forget: slow stages (parse -> embed -> upsert) run after response.
+    # Temp-file cleanup is done here so the file still exists when pipeline runs.
+    async def _background_ingest():
+        try:
+            await asyncio.to_thread(
+                rag_service.run_pipeline,
+                file_path=temp_file_path,
+                metadata=meta,
+                document_id=document_id,
+                file_hash=preflight["file_hash"],
+            )
+        finally:
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+
+    asyncio.ensure_future(_background_ingest())
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "message": (
+                f"'{safe_filename}' is being processed in the background. "
+                "Poll GET /rag/documents/{document_id} for status updates."
+            ),
+            "status": "processing",
+            "document_id": document_id,
+            "filename": safe_filename,
+            "user_id": user_id,
+            "session_id": session_id,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +221,7 @@ async def get_document(document_id: str):
 async def delete_document(document_id: str):
     """Delete a document's vectors from Qdrant and its DB record.
 
-    This is permanent — the document must be re-uploaded to be available
+    This is permanent -- the document must be re-uploaded to be available
     for retrieval again.
     """
     result = await asyncio.to_thread(rag_service.delete_document, document_id)

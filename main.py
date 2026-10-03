@@ -11,11 +11,24 @@ from app.config import settings
 from app.api.routes import router as api_router
 
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown events."""
-    # Database schema is now managed by Alembic migrations,
-    # so we no longer run SQLModel.metadata.create_all() here.
+    try:
+        from alembic.config import Config
+        from alembic import command
+        
+        logger.info("Running database migrations...")
+        cfg = Config("alembic.ini")
+        command.upgrade(cfg, "head")
+        logger.info("Database migrations complete.")
+    except Exception as e:
+        logger.error(f"Failed to run database migrations: {e}")
+        
     yield
 
 

@@ -13,9 +13,6 @@ from langgraph.types import Command
 from langchain_core.runnables import RunnableConfig
 from typing import Annotated
 
-from app.services.rag_service import rag_service, format_cited_context
-from app.services.query_rewriter import query_rewriter
-
 
 @tool
 def calculate(expression: str) -> str:
@@ -87,7 +84,10 @@ def get_current_time(timezone: str = "local") -> str:
 
 @tool
 def search_web(query: str) -> str:
-    """Search the web for up-to-date information, news, or general knowledge using DuckDuckGo."""
+    """Search the web for up-to-date information, news, or general knowledge using DuckDuckGo.
+    Do NOT use this for questions about the user's personal facts, name, or preferences —
+    those are already available in the system context from long-term memory.
+    """
     try:
         from duckduckgo_search import DDGS
         with DDGS() as ddgs:
@@ -109,7 +109,13 @@ async def retrieve_documents(
     config: RunnableConfig,
     runtime: ToolRuntime,
 ) -> Command:
-    """Retrieve relevant document snippets from the vector store based on a query.
+    """Search the uploaded knowledge base for relevant document snippets.
+
+    Use this tool ONLY when the user asks about content from documents they have
+    uploaded (e.g. PDFs, policy files, reports). Do NOT use this tool for:
+    - Questions about the user's personal facts, name, preferences, or history
+      (those are already provided in the system context via long-term memory).
+    - General knowledge or current events (use search_web instead).
 
     Returns a 【Doc N】-marked context block with source attribution. Citation
     metadata is written into ``rag_citations`` in AgentState via a
@@ -119,6 +125,12 @@ async def retrieve_documents(
     tool_call_id = runtime.tool_call_id
 
     try:
+        # Deferred imports — avoids loading torch/flashrank/HuggingFace at startup.
+        # Both rag_service and query_rewriter are module-level singletons; importing
+        # them here is cheap after the first call (Python caches sys.modules).
+        from app.services.rag_service import rag_service, format_cited_context  # noqa: PLC0415
+        from app.services.query_rewriter import query_rewriter  # noqa: PLC0415
+
         configurable = config.get("configurable", {})
         provider = configurable.get("provider", "openai")
         model = configurable.get("model", "gpt-4o-mini")

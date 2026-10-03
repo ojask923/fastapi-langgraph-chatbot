@@ -38,7 +38,8 @@ class ChatResponse(BaseModel):
         description=(
             "Source citations when the answer draws from retrieved documents. "
             "Each entry contains: index, filename, page_number, section, chunk_id, "
-            "document_id, rrf_score, rerank_score."
+            "document_id, dense_score, fusion_score (None when hybrid search is off), "
+            "rerank_score (None when reranking is off or failed)."
         ),
     )
 
@@ -80,7 +81,7 @@ async def create_session(payload: SessionCreateRequest):
 async def delete_session(session_id: str):
     """Delete a chat session and its messages from the database."""
     success = await asyncio.to_thread(db_service.delete_session, session_id)
-    agent.clear_history(session_id)
+    await agent.clear_history(session_id)
     if not success:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"status": "deleted", "session_id": session_id}
@@ -272,7 +273,7 @@ async def get_session_history(session_id: str):
 async def clear_session_history(session_id: str):
     """Clear message history in the database for a session."""
     await asyncio.to_thread(db_service.clear_session_messages, session_id)
-    agent.clear_history(session_id)
+    await agent.clear_history(session_id)
     return {"status": "cleared", "session_id": session_id}
 
 
@@ -302,8 +303,14 @@ async def health_check():
         checkpointer_error = None
 
     # Determine vector store backend
+    from app.services.qdrant_shared import vector_store_degraded, vector_store_degraded_reason
     vector_store_path = s.VECTOR_STORE_PATH
-    vector_backend = "qdrant-local" if vector_store_path else "qdrant-memory"
+    if vector_store_degraded:
+        vector_backend = "qdrant-memory (DEGRADED — path locked)"
+    elif vector_store_path:
+        vector_backend = "qdrant-local"
+    else:
+        vector_backend = "qdrant-memory"
 
     # Determine long-term memory (mem0) backend
     from app.services.memory import memory_service
@@ -313,7 +320,7 @@ async def health_check():
         memory_backend = "not yet initialised (lazy — fires on first chat)"
 
     return {
-        "status": "healthy" if db_healthy else "degraded",
+        "status": "healthy" if (db_healthy and not vector_store_degraded) else "degraded",
         "app": s.APP_NAME,
         "version": s.VERSION,
         "infrastructure": {
@@ -332,8 +339,10 @@ async def health_check():
             "vector_store": {
                 "backend": vector_backend,
                 "path": vector_store_path,
+                "degraded": vector_store_degraded,
+                "degraded_reason": vector_store_degraded_reason,
                 "embedding_model": s.EMBEDDING_MODEL,
-                "stores": ["rag_document_chunks"],
+                "stores": ["rag_document_chunks", "user_memories_hf"],
             },
             "long_term_memory": {
                 "backend": memory_backend,

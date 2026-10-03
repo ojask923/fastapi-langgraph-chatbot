@@ -69,6 +69,18 @@ class Settings(BaseSettings):
     # RERANK_MODEL: FlashRank cross-encoder model name
     RERANK_MODEL: str = "ms-marco-TinyBERT-L-2-v2"
 
+    # Minimum relevance thresholds — chunks below these scores are dropped before
+    # being passed to the LLM, so the model never receives essentially irrelevant
+    # context.  Set to 0.0 to disable the cutoff entirely.
+    #
+    # Applied in this priority order (only one branch runs per retrieval call):
+    #   1. MIN_RERANK_SCORE  — when ENABLE_RERANKING=True (FlashRank cross-encoder, ~0.0-1.0)
+    #   2. MIN_RRF_SCORE     — when ENABLE_HYBRID_SEARCH=True, reranking off (RRF score, ~0.01-0.03)
+    #   3. MIN_DENSE_SCORE   — dense-only, no reranking (raw cosine similarity, ~0.0-1.0)
+    MIN_RERANK_SCORE: float = 0.1
+    MIN_RRF_SCORE: float = 0.005
+    MIN_DENSE_SCORE: float = 0.3
+
     # RAG grounding/citation settings
     # When enabled, the ContextEngine injects citation rules into the system prompt
     # and the retrieve_documents tool returns structured 【Doc N】-marked context.
@@ -85,6 +97,14 @@ class Settings(BaseSettings):
 
     # Maximum number of Mem0 long-term memory results injected per query.
     MEM0_MAX_RESULTS: int = 5
+
+    # Provider and model used by mem0 for memory extraction.
+    # Intentionally decoupled from DEFAULT_PROVIDER so extraction always uses
+    # a reliable, high-TPM model regardless of which chat LLM the user picks.
+    # Groq options: "openai/gpt-oss-120b", "qwen/qwen3.8-27b"
+    # OpenAI option (recommended): "gpt-4o-mini"
+    MEM0_LLM_PROVIDER: str = "openai"
+    MEM0_LLM_MODEL: str = "gpt-4o-mini"
 
     # Rough token budget for the full assembled context sent to the LLM.
     # Used by ContextEngine to guard against runaway context size.
