@@ -13,6 +13,18 @@ from app.api.routes import router as api_router
 
 import logging
 
+# Configure logging before any service modules are imported so that the
+# level is established before alembic's fileConfig runs inside lifespan.
+# alembic.ini sets the root logger to WARN; without this, every INFO/DEBUG
+# log in the app would be silently dropped after the migration step.
+logging.basicConfig(
+    level=logging.WARNING,  # third-party libraries stay at WARNING
+    format="%(asctime)s %(levelname)-8s %(name)s - %(message)s",
+)
+logging.getLogger("app").setLevel(
+    getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
+)
+
 logger = logging.getLogger(__name__)
 
 @asynccontextmanager
@@ -23,7 +35,7 @@ async def lifespan(app: FastAPI):
         from alembic import command
         
         logger.info("Running database migrations...")
-        cfg = Config("alembic.ini")
+        cfg = Config(os.path.join(os.path.dirname(__file__), "alembic.ini"))
         command.upgrade(cfg, "head")
         logger.info("Database migrations complete.")
     except Exception as e:

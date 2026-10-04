@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     APP_NAME: str = "Simple Local Chatbot"
     VERSION: str = "1.0.0"
+    LOG_LEVEL: str = "INFO"  # root log level for the app; set DEBUG for verbose output
 
     # Default LLM configurations
     DEFAULT_PROVIDER: Literal["groq", "ollama", "openai", "gemini", "anthropic", "openrouter"] = "groq"

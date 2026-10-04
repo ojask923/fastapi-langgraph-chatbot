@@ -5,9 +5,12 @@ Architecture role
 Mem0 is used ONLY for long-term, stable user memory:
   preferences, facts, projects, goals, and important corrections.
 
-Two lightweight gate heuristics control Mem0 access:
+One lightweight gate heuristic controls Mem0 access:
   read gate  (_should_retrieve): skip trivial / short / greeting messages.
-  write gate (_should_store):    only persist long-term-worthy content.
+
+The write path calls mem0 unconditionally (for non-empty messages) and
+lets mem0's own LLM decide which facts are worth extracting.  A local
+keyword list (_STORE_INDICATORS) is kept only for the DB-fallback path.
 
 Search results are capped at MEM0_MAX_RESULTS (default 5).
 
@@ -283,10 +286,11 @@ class MemoryService:
         messages: List[Dict[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
     ):
-        """Extract and persist facts to long-term memory, write-gated.
+        """Extract and persist facts to long-term memory.
 
-        Only stores when the user message contains likely long-term-worthy
-        content (personal facts, preferences, corrections, goals, etc.).
+        Delegates fact extraction entirely to mem0's own LLM — no keyword
+        gate here, so personal facts like "I like CR7" or "I finished my
+        degree" are captured even when they don't match a fixed phrase list.
         """
         if not user_id or not messages:
             return
@@ -294,7 +298,7 @@ class MemoryService:
         user_text = next(
             (m["content"] for m in messages if m.get("role") == "user"), ""
         )
-        if not user_text or not _should_store(user_text):
+        if not user_text:
             return
 
         await self.initialize()

@@ -117,6 +117,10 @@ async def retrieve_documents(
       (those are already provided in the system context via long-term memory).
     - General knowledge or current events (use search_web instead).
 
+    Call this tool AT MOST ONCE per turn. If the user asks multiple questions
+    about the document, combine them into a single query string instead of
+    issuing parallel calls.
+
     Returns a 【Doc N】-marked context block with source attribution. Citation
     metadata is written into ``rag_citations`` in AgentState via a
     ``Command(update=...)`` so it is properly persisted by LangGraph and

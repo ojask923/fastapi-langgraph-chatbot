@@ -387,26 +387,39 @@ class RAGService:
                     if not words:
                         continue
                     
-                    # Sort words by vertical position, then horizontal
-                    words.sort(key=lambda w: (round(w["top"], 1), w["x0"]))
-                    
+                    # Sort words by vertical position only so the grouping step
+                    # sees them in top-to-bottom order without x0 influencing which
+                    # line a word belongs to.
+                    words.sort(key=lambda w: w["top"])
+
                     lines = []
-                    current_line = []
-                    current_top = None
-                    
+                    current_line: list = []
+                    line_anchor_top: float | None = None
+
                     for w in words:
-                        if current_top is None or abs(w["top"] - current_top) < 3: # 3 pt tolerance
-                            current_line.append(w)
-                            if current_top is None:
-                                current_top = w["top"]
-                        else:
-                            lines.append(current_line)
+                        if line_anchor_top is None:
+                            # First word — start the first line.
                             current_line = [w]
-                            current_top = w["top"]
+                            line_anchor_top = w["top"]
+                        else:
+                            # Use a tolerance relative to the word's font size so
+                            # that superscripts/subscripts (which share a visual
+                            # line with normal-size text) are not split off.
+                            tol = max(3.0, 0.5 * w.get("size", 0))
+                            if w["top"] - line_anchor_top <= tol:
+                                current_line.append(w)
+                            else:
+                                lines.append(current_line)
+                                current_line = [w]
+                                line_anchor_top = w["top"]
+
                     if current_line:
                         lines.append(current_line)
-                    
+
                     for line_words in lines:
+                        # Sort words within each line left-to-right so reading
+                        # order is preserved regardless of top-value jitter.
+                        line_words.sort(key=lambda w: w["x0"])
                         text = " ".join(w["text"] for w in line_words)
                         max_size = max((w["size"] for w in line_words), default=0)
                         is_bold = any("bold" in str(w.get("fontname", "")).lower() for w in line_words)
@@ -624,7 +637,18 @@ class RAGService:
             add_start_index=True,
         )
         
-        # Group contiguous documents by section and page_number
+        def _join_group(group: List[Document]) -> str:
+            """Join a group of per-line Documents into a single string.
+
+            PDFs use _merge_lines (de-hyphenation + soft-wrap collapse).
+            Markdown and plain-text documents are joined with newlines so that
+            bullet lists, indentation, and fenced code blocks are preserved.
+            """
+            doc_type = group[0].metadata.get("document_type", "").lower()
+            if doc_type == "pdf":
+                return self._merge_lines(group)
+            return "\n".join(d.page_content for d in group)
+
         grouped_docs = []
         if documents:
             current_group = [documents[0]]
@@ -638,14 +662,14 @@ class RAGService:
                 if same_section and same_page and same_doc:
                     current_group.append(doc)
                 else:
-                    merged_text = self._merge_lines(current_group)
+                    merged_text = _join_group(current_group)
                     merged_metadata = current_group[0].metadata.copy()
                     merged_metadata.pop("layout", None)
                     grouped_docs.append(Document(page_content=merged_text, metadata=merged_metadata))
                     current_group = [doc]
             
             if current_group:
-                merged_text = self._merge_lines(current_group)
+                merged_text = _join_group(current_group)
                 merged_metadata = current_group[0].metadata.copy()
                 merged_metadata.pop("layout", None)
                 grouped_docs.append(Document(page_content=merged_text, metadata=merged_metadata))

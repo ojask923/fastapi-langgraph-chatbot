@@ -25,7 +25,7 @@ class ChatRequest(BaseModel):
     provider: Optional[str] = Field(default=None, description="LLM provider: groq, ollama, openai, gemini, anthropic")
     model: Optional[str] = Field(default=None, description="Model identifier")
     system_prompt: Optional[str] = Field(default=None, description="Custom system instructions")
-    temperature: Optional[float] = Field(default=0.7, ge=0.0, le=1.0)
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
 
 class ChatResponse(BaseModel):
@@ -101,7 +101,7 @@ async def chat_endpoint(payload: ChatRequest):
             provider=payload.provider or settings.DEFAULT_PROVIDER,
             model=payload.model or settings.DEFAULT_MODEL,
             system_prompt=payload.system_prompt,
-            temperature=payload.temperature or settings.TEMPERATURE,
+            temperature=payload.temperature if payload.temperature is not None else settings.TEMPERATURE,
         )
 
         # Save assistant response to database
@@ -138,7 +138,7 @@ async def chat_stream_endpoint(payload: ChatRequest):
                 provider=payload.provider or settings.DEFAULT_PROVIDER,
                 model=payload.model or settings.DEFAULT_MODEL,
                 system_prompt=payload.system_prompt,
-                temperature=payload.temperature or settings.TEMPERATURE,
+                temperature=payload.temperature if payload.temperature is not None else settings.TEMPERATURE,
             ):
                 if event.get("type") == "token":
                     accumulated_response += event.get("content", "")

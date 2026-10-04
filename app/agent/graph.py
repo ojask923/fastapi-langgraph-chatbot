@@ -84,6 +84,22 @@ def _build_pg_conn_string(db_url: str) -> str:
 # AgentState
 # ---------------------------------------------------------------------------
 
+def _merge_citations(left: dict, right: dict | None) -> dict:
+    """Reducer for rag_citations that supports parallel tool-call updates.
+
+    LangGraph applies this function when multiple graph nodes (e.g. two
+    parallel retrieve_documents calls) write to the same state key in a
+    single step.  Without a reducer, LangGraph raises InvalidUpdateError.
+
+    ``right=None`` is the turn-start reset sentinel sent by get_response /
+    stream_response at the beginning of each user turn so that stale
+    citations from a prior turn are cleared before new retrieval runs.
+    """
+    if right is None:
+        return {}
+    return {**(left or {}), **right}
+
+
 class AgentState(TypedDict):
     """LangGraph state carrying message history, a rolling summary, and RAG citations.
 
@@ -95,7 +111,7 @@ class AgentState(TypedDict):
     """
     messages: Annotated[List[BaseMessage], add_messages]
     summary: str
-    rag_citations: dict  # citation_map from the last retrieve_structured() call
+    rag_citations: Annotated[dict, _merge_citations]  # merged by reducer; None resets
 
 
 # ---------------------------------------------------------------------------
@@ -211,12 +227,13 @@ class ChatAgent:
         self,
         provider: Optional[str] = None,
         model: Optional[str] = None,
-        temperature: float = 0.7,
+        temperature: Optional[float] = None,
     ):
         """Construct a compiled StateGraph for the selected provider and model."""
         assert self.checkpointer is not None, "call await _ensure_checkpointer() before build_graph()"
 
         provider = provider or settings.DEFAULT_PROVIDER
+        temperature = temperature if temperature is not None else settings.TEMPERATURE
         cache_key = f"{provider}_{model}_{temperature}"
 
         if cache_key in self._compiled_graphs:
@@ -268,7 +285,9 @@ class ChatAgent:
                     + "user's message references \"the document\", \"this file\", "
                     + "\"what I uploaded\", \"the report\", \"the PDF\", or any "
                     + "phrasing that implies they want information from an uploaded "
-                    + "file. Do NOT answer document questions from memory alone."
+                    + "file. Do NOT answer document questions from memory alone. "
+                    + "Call `retrieve_documents` AT MOST ONCE per turn; combine "
+                    + "multiple sub-questions into a single query string."
                 )
                 active_tools = self.tools  # full tool list
             else:
@@ -324,7 +343,7 @@ class ChatAgent:
             )
 
             response = await active_llm.ainvoke(final_messages)
-            return {"messages": [response], "rag_citations": {}}
+            return {"messages": [response]}
 
         # ---- summarize node -----------------------------------------------
         async def maybe_summarize(state: AgentState, config: RunnableConfig):
@@ -387,12 +406,13 @@ class ChatAgent:
         provider: Optional[str] = None,
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
-        temperature: float = 0.7,
+        temperature: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Invoke the graph and return the final reply."""
         await self._ensure_checkpointer()
 
         provider = provider or settings.DEFAULT_PROVIDER
+        temperature = temperature if temperature is not None else settings.TEMPERATURE
         graph = self.build_graph(provider, model, temperature)
 
         config = {
@@ -408,6 +428,7 @@ class ChatAgent:
         # Only send the new HumanMessage; LangGraph loads prior state from checkpointer
         input_state: Dict[str, Any] = {
             "messages": [HumanMessage(content=message)],
+            "rag_citations": None,  # None sentinel triggers _merge_citations reset
         }
         result = await graph.ainvoke(input_state, config=config)
 
@@ -453,12 +474,13 @@ class ChatAgent:
         provider: Optional[str] = None,
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
-        temperature: float = 0.7,
+        temperature: Optional[float] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Stream response tokens and tool call notifications."""
         await self._ensure_checkpointer()
 
         provider_clean = (provider or settings.DEFAULT_PROVIDER).lower()
+        temperature = temperature if temperature is not None else settings.TEMPERATURE
         graph = self.build_graph(provider_clean, model, temperature)
 
         config = {
@@ -473,6 +495,7 @@ class ChatAgent:
 
         input_state: Dict[str, Any] = {
             "messages": [HumanMessage(content=message)],
+            "rag_citations": None,  # None sentinel triggers _merge_citations reset
         }
         accumulated_text = ""
 
